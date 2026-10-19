@@ -8,6 +8,7 @@ sek: API keys encrypted by this Mac's Secure Enclave
                                   (asks for Touch ID or your password on use, unless --no-auth)
   sek set NAME                    store a secret (prompts, or reads stdin)
   sek get NAME                    print a secret
+  sek get --json NAME...          print several secrets as JSON (one prompt)
   sek list                        list secret names
   sek rm NAME                     delete a secret
   sek run [-e FILE]... [--] CMD   run CMD with every sek://NAME value resolved,
@@ -175,6 +176,24 @@ func main() throws {
         FileHandle.standardError.write(Data("\(existed ? "Updated" : "Stored") \(name)\n".utf8))
 
     case "get":
+        if args.first == "--json" {
+            // Several secrets with one prompt, as {"NAME": "value"}; used by the OpenCode plugin.
+            let names = Array(args.dropFirst())
+            guard !names.isEmpty else { throw SekError("usage: sek get --json NAME...") }
+            try names.forEach(Store.validate)
+            try Store.requireInitialized()
+            let resolver = Resolver(reason: "read \(names.joined(separator: ", "))")
+            var values: [String: String] = [:]
+            for name in names {
+                guard let text = String(data: try resolver.value(name), encoding: .utf8) else {
+                    throw SekError("secret '\(name)' is not text")
+                }
+                values[name] = text
+            }
+            let json = try JSONSerialization.data(withJSONObject: values, options: [.sortedKeys])
+            FileHandle.standardOutput.write(json + Data("\n".utf8))
+            break
+        }
         let name = try requireName(args, "sek get NAME")
         try Store.requireInitialized()
         let value = try Resolver(reason: "read \(name)").value(name)

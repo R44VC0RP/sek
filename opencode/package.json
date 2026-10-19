@@ -1,0 +1,11 @@
+{
+  "name": "opencode-sek",
+  "version": "0.1.0",
+  "description": "OpenCode plugin: let agents request API keys from sek (Secure Enclave) without ever seeing them",
+  "type": "module",
+  "license": "MIT",
+  "exports": { ".": "./src/index.ts" },
+  "files": ["src"],
+  "dependencies": { "@opencode/plugin": "^2.0.32" },
+  "devDependencies": { "typescript": "^5.9.0", "@types/node": "^22.0.0" }
+}
