@@ -65,15 +65,39 @@ During a session, `get` and `run` don't prompt. The session ends at the TTL (24h
 | `sek_request` | Reads keys (Touch ID, or nothing during a `sek unlock` session) and grants them to the session |
 | `sek_revoke` | Stops injecting keys into the session |
 
-Granted keys are set as environment variables in that session's shell commands, so the agent writes `curl -H "Authorization: Bearer $OPENAI_API_KEY" …`. Any copy of a value in tool output is replaced with `[sek:NAME]` before the model sees it. Grants last 60 minutes by default.
+Granted keys are set as environment variables in that session's shell commands, so the agent writes `curl -H "Authorization: Bearer $OPENAI_API_KEY" …`. Any copy of a value in tool output, and in anything sent to the model, is replaced with `[sek:NAME]`. Grants last 60 minutes by default.
 
-Install it by adding `.opencode/plugins/sek.ts` to a project (or `~/.config/opencode/plugins/sek.ts` for every project):
+### Approving requests in the TUI
+
+When an agent calls `sek_request`, the TUI asks before any key is read:
+
+```
+Agent wants OPENAI_API_KEY
+  Deny
+  Allow once               agent says: run the OpenAI eval script
+  Allow for this session   Fix eval flakiness · ~/dev/app
+```
+
+- **Deny** is preselected, and Escape or closing the dialog also denies. **Allow once** approves this request. **Allow for this session** approves these keys for the rest of the session, so later requests for them skip the dialog.
+- After you allow, sek still asks for Touch ID unless a `sek unlock` session is active.
+- With several TUIs open, the first answer wins and the other dialogs close.
+- With no TUI attached (for example `opencode run`), Touch ID is the only gate. Set `requireApproval: true` to refuse instead.
+
+### Install
+
+Create `.opencode/plugins/sek/` in a project, or `~/.config/opencode/plugins/sek/` for every project, with two files:
 
 ```ts
+// index.ts
 export { default } from "/path/to/sek/opencode/src/index.ts"
 ```
 
-Then run `bun install` in `opencode/`. Options (`bin`, `ttlMinutes`) can be passed with the `plugins` entry in `opencode.json`.
+```ts
+// tui.ts
+export { default } from "/path/to/sek/opencode/src/tui.ts"
+```
+
+Then run `bun install` in `opencode/`. Options (`bin`, `ttlMinutes`, `requireApproval`) can be passed with the `plugins` entry in `opencode.json`.
 
 ## How it works
 
@@ -85,7 +109,9 @@ Then run `bun install` in `opencode/`. Options (`bin`, `ttlMinutes`) can be pass
 
 - **Same-user trust.** Like `ssh-agent`, an unlocked session serves any process running as your user, and a secret handed to a program's environment can be read by other processes of yours. sek protects secrets at rest and makes you approve access; it doesn't sandbox your own processes.
 - **Device-bound.** Keys can't be exported or backed up. A wiped or new Mac can't open old secrets, so keep originals in a password manager.
-- **Plugin redaction is best effort.** It catches exact copies of a value in tool output. An agent that encodes, splits or transforms a value (base64, `cut`, writing it to a file it later reads differently) can still expose it. Treat it as a guard against accidents, not against a hostile agent.
+- **Plugin redaction is best effort.** It catches exact copies of a value. Encoded or transformed copies are not caught: base64 (`Authorization: Basic`), URL or JSON escaping, hex, slices like `${KEY:0:8}`, values split across lines or cut by output truncation. Full shell output saved to disk for long commands contains the raw value. An agent with a key can also send it anywhere (`curl -d "$KEY" …`); the tool description asks it not to, but nothing enforces that. Treat redaction as a guard against accidents, not against a hostile agent.
+- **The approval dialog is consent, not a sandbox.** Anything running as you, including an agent's shell, can call OpenCode's API and answer the dialog itself, or run `sek get` directly. Against a hostile agent, the control is Touch ID: avoid `sek unlock` while such an agent is running.
+- **Grants are per OpenCode session.** Subagents and your own `!` shell commands don't receive them.
 - Touch ID doesn't work over SSH.
 
 ## License

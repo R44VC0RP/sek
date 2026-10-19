@@ -5,6 +5,7 @@ import { homedir } from "node:os"
 import { join } from "node:path"
 import { Plugin } from "@opencode/plugin"
 import { Error as ToolError } from "@opencode/plugin/promise/tool"
+import { Sek, type Decision } from "./rpc.js"
 
 /**
  * Lets agents request API keys from sek without ever seeing them.
@@ -21,6 +22,12 @@ const ENV = /^[A-Za-z_][A-Za-z0-9_]*$/
 const PENDING_MS = 5 * 60_000
 const MIN_REDACT = 8
 const TAG = /\n# sek:([0-9a-f-]{36})$/
+/** How long to wait for any TUI to acknowledge a request before treating the session as headless. */
+const ACK_MS = 3_000
+/** How long the user has to answer the approval dialog. */
+const DECIDE_MS = 5 * 60_000
+
+type Outcome = Decision | "headless" | "timeout" | "aborted"
 
 function findBinary(configured: unknown): string {
   if (typeof configured === "string" && configured) return configured
@@ -53,6 +60,81 @@ export default Plugin.define({
   async setup(ctx) {
     const bin = findBinary(ctx.options.bin)
     const ttlMinutes = typeof ctx.options.ttlMinutes === "number" ? ctx.options.ttlMinutes : 60
+    // Without a TUI (e.g. `opencode run`), Touch ID is the only gate unless this is set.
+    const requireApproval = ctx.options.requireApproval === true
+
+    /** requestID → waiting approval */
+    const approvals = new Map<
+      string,
+      { acked: boolean; onAck: () => void; resolve: (decision: Outcome) => void }
+    >()
+    /** sessionID → key names the user approved for the rest of the session */
+    const approvedForSession = new Map<string, Set<string>>()
+
+    const rpc = await ctx.rpc.register(Sek, {
+      ack: async (input) => {
+        const pending = approvals.get((input as { requestID: string }).requestID)
+        if (pending && !pending.acked) {
+          pending.acked = true
+          pending.onAck()
+        }
+        return { ok: pending !== undefined }
+      },
+      decide: async (input) => {
+        const { requestID, decision } = input as { requestID: string; decision: Decision }
+        const pending = approvals.get(requestID)
+        pending?.resolve(decision)
+        return { ok: pending !== undefined }
+      },
+    })
+
+    /** Asks any attached TUI to approve. Resolves "headless" when no TUI acknowledges. */
+    const approve = async (
+      sessionID: string,
+      names: string[],
+      reason: string,
+      signal: AbortSignal,
+    ): Promise<Outcome> => {
+      if (signal.aborted) return "aborted"
+      const approved = approvedForSession.get(sessionID)
+      if (approved && names.every((name) => approved.has(name))) return "session"
+
+      const requestID = randomUUID()
+      let ackTimer: ReturnType<typeof setTimeout> | undefined
+      let decideTimer: ReturnType<typeof setTimeout> | undefined
+      const result = new Promise<Outcome>((resolve) => {
+        const finish = (decision: Outcome) => {
+          clearTimeout(ackTimer)
+          clearTimeout(decideTimer)
+          signal.removeEventListener("abort", onAbort)
+          approvals.delete(requestID)
+          resolve(decision)
+        }
+        const onAbort = () => finish("aborted")
+        signal.addEventListener("abort", onAbort)
+        approvals.set(requestID, {
+          acked: false,
+          onAck: () => {
+            clearTimeout(ackTimer)
+            decideTimer = setTimeout(() => finish("timeout"), DECIDE_MS)
+          },
+          resolve: finish,
+        })
+        ackTimer = setTimeout(() => finish("headless"), ACK_MS)
+      })
+      // The reason comes from the agent: keep it to one short plain line in the dialog.
+      const shown = reason.replace(/[\u0000-\u001f\u007f-\u009f]+/g, " ").trim().slice(0, 120)
+      await rpc.events.emit("requested", { requestID, sessionID, names, reason: shown })
+      const decision = await result
+      // Always announce the end, so a dialog opened late (after a headless fallback) closes.
+      await rpc.events.emit("resolved", { requestID, decision }).catch(() => {})
+      if (decision === "session") {
+        const set = approvedForSession.get(sessionID) ?? new Set<string>()
+        names.forEach((name) => set.add(name))
+        approvedForSession.set(sessionID, set)
+      }
+      return decision
+    }
 
     /** sessionID → env var → grant */
     const grants = new Map<string, Map<string, Grant>>()
@@ -148,6 +230,21 @@ export default Plugin.define({
             if (!ENV.test(variable)) throw new ToolError({ message: `Invalid environment variable '${variable}'` })
           }
 
+          await context.progress({ status: `Waiting for approval to use ${names.join(", ")}` })
+          const decision = await approve(context.sessionID, names, reason, context.signal)
+          if (decision === "deny") {
+            throw new ToolError({ message: `The user denied access to ${names.join(", ")}. Do not retry unless asked.` })
+          }
+          if (decision === "timeout") {
+            throw new ToolError({ message: `Nobody answered the approval request for ${names.join(", ")}.` })
+          }
+          if (decision === "aborted") {
+            throw new ToolError({ message: "The request was cancelled before it was approved." })
+          }
+          if (decision === "headless" && requireApproval) {
+            throw new ToolError({ message: "sek needs approval in the OpenCode TUI, and no TUI is attached." })
+          }
+
           // Applies the user's permission rules for action "sek" (resources are key names). Older
           // OpenCode builds lack assert(); Touch ID (or an explicit `sek unlock`) still gates access.
           await ctx.permission.assert?.({
@@ -204,6 +301,9 @@ export default Plugin.define({
         },
         execute: async (input, context) => {
           const { names } = input as { names?: string[] }
+          const approved = approvedForSession.get(context.sessionID)
+          if (names) names.forEach((name) => approved?.delete(name))
+          else approvedForSession.delete(context.sessionID)
           const session = grants.get(context.sessionID)
           if (!session || session.size === 0) return { content: "Nothing was granted to this session." }
           const removed: string[] = []
@@ -266,6 +366,8 @@ export default Plugin.define({
     })
 
     return () => {
+      for (const pending of approvals.values()) pending.resolve("aborted")
+      approvedForSession.clear()
       grants.clear()
       redactions.clear()
       pending.clear()
